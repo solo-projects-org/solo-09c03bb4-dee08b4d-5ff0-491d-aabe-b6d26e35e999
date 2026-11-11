@@ -1,10 +1,14 @@
 services:
-  suppression-check:
+  rounding-totals:
     build: .
-    image: suppression-check:1.0.0
-    container_name: suppression-check
+    image: rounding-totals:1.0.0
+    container_name: rounding-totals
     ports:
       - "8000:8000"
+    volumes:
+      - rounding-data:/data
+    environment:
+      ROUNDING_DB_PATH: /data/rounding.db
     restart: unless-stopped
     healthcheck:
       test:
@@ -16,3 +20,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  rounding-data:

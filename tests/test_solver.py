@@ -1,267 +1,310 @@
-"""solver 单元测试：已知区间、可还原、冲突，以及暴力枚举交叉验证。"""
+"""solver 单元测试：取整规则、样例批次与暴力枚举交叉验证。"""
 
 from __future__ import annotations
 
-from itertools import product
+import itertools
+import random
 
 import pytest
 
 from app import solver
-from app.schemas import EX_HALL_CONFLICT, EX_RANGE, EX_RECOVERABLE, EX_TOTAL_CONFLICT
+from app.solver import COL, GRAND, ROW
+from app.schemas import (
+    EX_BATCH_1,
+    EX_BATCH_2,
+    EX_BATCH_COMBINED,
+    EX_TABLE,
+)
 
 
-def _feasible_assignments(matrix, row_totals, col_totals):
-    """枚举隐藏格全部非负整数赋值，返回满足所有合计的赋值字典列表。"""
+# ---------------------------------------------------------------------------
+# 取整基础函数
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "value, low, high",
+    [
+        (0, 0, 0),
+        (5, 5, 5),
+        (10, 10, 10),
+        (6, 5, 10),
+        (9, 5, 10),
+        (12, 10, 15),
+        (14, 10, 15),
+        (101, 100, 105),
+    ],
+)
+def test_floor_ceil(value, low, high):
+    assert solver.floor5(value) == low
+    assert solver.ceil5(value) == high
+    # 5 的倍数原样保留
+    if value % 5 == 0:
+        assert solver.floor5(value) == solver.ceil5(value) == value
+
+
+# ---------------------------------------------------------------------------
+# Swagger 样例：两批各自可行、合在一起冲突
+# ---------------------------------------------------------------------------
+
+def _batch_constraints(batch: dict) -> dict:
+    constraints: dict = {}
+    for i, value in enumerate(batch["row_totals"]):
+        if value is not None:
+            constraints[(ROW, i)] = value
+    for j, value in enumerate(batch["col_totals"]):
+        if value is not None:
+            constraints[(COL, j)] = value
+    if batch.get("grand_total") is not None:
+        constraints[(GRAND, 0)] = batch["grand_total"]
+    return constraints
+
+
+def test_sample_batches_each_feasible_but_combined_conflict():
+    matrix = EX_TABLE["matrix"]
+
+    b1 = _batch_constraints(EX_BATCH_1)
+    b2 = _batch_constraints(EX_BATCH_2)
+
+    rounded_1, reasons_1 = solver.solve(matrix, b1)
+    assert reasons_1 == [] and rounded_1 is not None
+    _assert_matrix_valid(matrix, rounded_1)
+    _assert_constraints_met(rounded_1, b1)
+
+    rounded_2, reasons_2 = solver.solve(matrix, b2)
+    assert reasons_2 == [] and rounded_2 is not None
+    _assert_matrix_valid(matrix, rounded_2)
+    _assert_constraints_met(rounded_2, b2)
+
+    combined, reasons_3 = solver.solve(matrix, {**b1, **b2})
+    assert combined is None
+    assert reasons_3  # 有结构化冲突原因
+
+
+def test_combined_example_conflicts_after_batch_one():
+    matrix = EX_TABLE["matrix"]
+    b1 = _batch_constraints(EX_BATCH_1)
+    # Swagger 合并样例：在第一批（行 0 向上）之上再要求列 1 向上
+    merged = {**b1, **_batch_constraints(EX_BATCH_COMBINED)}
+    rounded, reasons = solver.solve(matrix, merged)
+    assert rounded is None
+    assert reasons
+    assert any("可行流" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# 无约束时总可行，且矩阵完全合规
+# ---------------------------------------------------------------------------
+
+def test_unconstrained_always_feasible():
+    matrix = [
+        [6, 7, 3],
+        [8, 9, 10],
+        [0, 14, 5],
+    ]
+    rounded, reasons = solver.solve(matrix)
+    assert reasons == []
+    _assert_matrix_valid(matrix, rounded)
+
+
+def test_all_multiples_of_five_unchanged():
+    matrix = [[5, 10, 0], [15, 20, 25]]
+    rounded, reasons = solver.solve(matrix)
+    assert reasons == []
+    assert rounded == matrix  # 全部已是 5 的倍数，原样保留
+    assert solver.solve(matrix, {(ROW, 0): 15, (GRAND, 0): 75})[0] == matrix
+
+
+def test_zero_matrix():
+    matrix = [[0, 0], [0, 0]]
+    rounded, reasons = solver.solve(matrix)
+    assert reasons == [] and rounded == matrix
+    rounded, reasons = solver.solve(matrix, {(GRAND, 0): 0})
+    assert reasons == [] and rounded == matrix
+
+
+def test_illegal_constraint_rejected():
+    matrix = [[6, 7]]  # 行原合计 13，合法取整区间 [10, 15]
+    _, reasons = solver.solve(matrix, {(ROW, 0): 20})
+    assert any("合法取整区间" in r for r in reasons)
+
+    _, reasons = solver.solve(matrix, {(ROW, 0): 12})  # 不是 5 的倍数
+    assert any("5 的倍数" in r for r in reasons)
+
+    _, reasons = solver.solve(matrix, {("unknown", 0): 10})
+    assert any("未知约束种类" in r for r in reasons)
+
+
+def test_grand_total_constraint():
+    matrix = [[6, 5], [5, 7]]
+    # 原总计 23，合法取整区间 [20, 25]
+    rounded, reasons = solver.solve(matrix, {(GRAND, 0): 20})
+    assert reasons == []
+    assert sum(sum(row) for row in rounded) == 20
+
+    rounded, reasons = solver.solve(matrix, {(GRAND, 0): 25})
+    assert reasons == []
+    assert sum(sum(row) for row in rounded) == 25
+
+    _, reasons = solver.solve(matrix, {(GRAND, 0): 30})
+    assert any("合法取整区间" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# 暴力枚举交叉验证
+# ---------------------------------------------------------------------------
+
+def _all_legal_rounded_matrices(matrix):
+    """枚举全部逐格取整组合，仅保留行/列/总计也合法的矩阵。"""
     rows, cols = len(matrix), len(matrix[0])
-    hidden = [
-        (i, j)
-        for i in range(rows)
+    options = [
+        [solver.rounding_options(v) for v in row]
+        for row in matrix
+    ]
+    row_legal = [solver.rounding_options(sum(matrix[i])) for i in range(rows)]
+    col_legal = [
+        solver.rounding_options(sum(matrix[i][j] for i in range(rows)))
         for j in range(cols)
-        if matrix[i][j] is None
     ]
-    total = sum(row_totals)
-    solutions = []
-    for values in product(range(total + 1), repeat=len(hidden)):
-        full = [row[:] for row in matrix]
-        for (i, j), v in zip(hidden, values):
-            full[i][j] = v
-        if all(sum(full[i]) == row_totals[i] for i in range(rows)) and all(
-            sum(full[i][j] for i in range(rows)) == col_totals[j]
-            for j in range(cols)
-        ):
-            solutions.append(dict(zip(hidden, values)))
-    return solutions
+    grand_legal = solver.rounding_options(sum(sum(r) for r in matrix))
 
-
-def test_range_example_known_bounds():
-    result = solver.analyze(**EX_RANGE)
-    assert result["status"] == "feasible"
-    assert result["hidden_count"] == 6
-    assert result["recoverable_count"] == 0
-    by_pos = {(c["row"], c["col"]): c for c in result["cells"]}
-    expected = {
-        (0, 1): (0, 4),
-        (0, 2): (3, 7),
-        (1, 0): (0, 4),
-        (1, 2): (3, 7),
-        (2, 0): (0, 4),
-        (2, 1): (2, 6),
-    }
-    for pos, (lo, hi) in expected.items():
-        assert by_pos[pos]["min"] == lo
-        assert by_pos[pos]["max"] == hi
-        assert by_pos[pos]["recoverable"] is False
-
-    # 两张完整矩阵都必须真实满足公开合计
-    for key in ("minimizer_matrix", "maximizer_matrix"):
-        m = result[key]
-        assert all(
-            sum(m[i]) == EX_RANGE["row_totals"][i] for i in range(3)
-        )
-        assert all(
-            sum(m[i][j] for i in range(3)) == EX_RANGE["col_totals"][j]
-            for j in range(3)
-        )
-        assert all(v >= 0 for row in m for v in row)
-
-    # 极值矩阵对扫描序第一个隐藏格 (0,1) 达到各自界
-    first = result["cells"][0]
-    assert result["minimizer_matrix"][0][1] == first["min"]
-    assert result["maximizer_matrix"][0][1] == first["max"]
-
-
-def test_recoverable_example_all_locked():
-    result = solver.analyze(**EX_RECOVERABLE)
-    assert result["hidden_count"] == 4
-    assert result["recoverable_count"] == 4
-    assert all(c["recoverable"] and c["min"] == c["max"] for c in result["cells"])
-    expected_full = [[2, 5, 3], [2, 4, 4], [5, 1, 3]]
-    assert result["minimizer_matrix"] == expected_full
-    assert result["maximizer_matrix"] == expected_full
-    by_pos = {(c["row"], c["col"]): c["min"] for c in result["cells"]}
-    assert by_pos == {(0, 1): 5, (1, 0): 2, (1, 2): 4, (2, 2): 3}
-
-
-def test_total_mismatch_conflict():
-    with pytest.raises(solver.SuppressionConflict) as exc:
-        solver.analyze(**EX_TOTAL_CONFLICT)
-    assert "行合计之和" in exc.value.reasons[0]
-    assert exc.value.witness is None
-
-
-def test_hall_conflict_with_witness():
-    with pytest.raises(solver.SuppressionConflict) as exc:
-        solver.analyze(**EX_HALL_CONFLICT)
-    assert exc.value.witness is not None
-    w = exc.value.witness
-    assert w["max_flow"] < w["required_flow"]
-    # Hall 条件：行子集需求 > 其邻接列可承接的供给
-    assert w["subset_demand"] > w["neighbor_supply"]
-    assert 0 in w["row_subset"] and 0 in w["neighbor_cols"]
-    assert "最大流" in " ".join(exc.value.reasons)
-
-
-def test_fixed_cells_exceed_totals():
-    payload = {
-        "matrix": [[9, None], [None, 1]],
-        "row_totals": [5, 5],
-        "col_totals": [10, 0],
-    }
-    with pytest.raises(solver.SuppressionConflict) as exc:
-        solver.analyze(**payload)
-    assert any("超过公开行合计" in r for r in exc.value.reasons)
-
-
-def test_no_hidden_cells_matching():
-    payload = {
-        "matrix": [[1, 2], [3, 4]],
-        "row_totals": [3, 7],
-        "col_totals": [4, 6],
-    }
-    result = solver.analyze(**payload)
-    assert result["hidden_count"] == 0
-    assert result["cells"] == []
-
-
-def test_no_hidden_cells_mismatch():
-    payload = {
-        "matrix": [[1, 2], [3, 4]],
-        "row_totals": [3, 7],
-        "col_totals": [5, 5],
-    }
-    with pytest.raises(solver.SuppressionConflict):
-        solver.analyze(**payload)
-
-
-def test_brute_force_cross_check():
-    """随机小规模可行问题：LP 区间必须与暴力枚举完全一致。"""
-    import random
-
-    rng = random.Random(20261110)
-    checked = 0
-    for seed in range(40):
-        rng.seed(1000 + seed)
-        rows, cols = rng.randint(2, 3), rng.randint(2, 3)
-        full = [
-            [rng.randint(0, 3) for _ in range(cols)] for _ in range(rows)
+    choices = [list(opt) for row in options for opt in row]
+    legal = []
+    for picked in itertools.product(*choices):
+        candidate = [
+            list(picked[i * cols:(i + 1) * cols]) for i in range(rows)
         ]
-        row_totals = [sum(r) for r in full]
-        col_totals = [sum(full[i][j] for i in range(rows)) for j in range(cols)]
-        if sum(row_totals) > 14:
+        row_sums = [sum(candidate[i]) for i in range(rows)]
+        col_sums = [sum(candidate[i][j] for i in range(rows)) for j in range(cols)]
+        grand = sum(row_sums)
+        if any(not (lo <= s <= hi) for s, (lo, hi) in zip(row_sums, row_legal)):
             continue
+        if any(not (lo <= s <= hi) for s, (lo, hi) in zip(col_sums, col_legal)):
+            continue
+        if not grand_legal[0] <= grand <= grand_legal[1]:
+            continue
+        legal.append(candidate)
+    return legal
 
-        positions = [(i, j) for i in range(rows) for j in range(cols)]
-        k = rng.randint(2, min(3, len(positions)))
-        masked = set(rng.sample(positions, k))
-        matrix = [
-            [None if (i, j) in masked else full[i][j] for j in range(cols)]
-            for i in range(rows)
-        ]
 
-        result = solver.analyze(matrix, row_totals, col_totals)
-        brute = _feasible_assignments(matrix, row_totals, col_totals)
-        assert brute, "随机问题由真实矩阵生成，必然存在可行解"
-        checked += 1
+def _brute_force_feasible(legal_matrices, constraints):
+    for candidate in legal_matrices:
+        rows, cols = len(candidate), len(candidate[0])
+        row_sums = [sum(candidate[i]) for i in range(rows)]
+        col_sums = [sum(candidate[i][j] for i in range(rows)) for j in range(cols)]
+        grand = sum(row_sums)
+        ok = True
+        for (kind, pos), value in constraints.items():
+            actual = (
+                row_sums[pos] if kind == ROW
+                else col_sums[pos] if kind == COL
+                else grand
+            )
+            if actual != value:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
 
-        for cell in result["cells"]:
-            pos = (cell["row"], cell["col"])
-            vals = [sol[pos] for sol in brute]
-            assert cell["min"] == min(vals)
-            assert cell["max"] == max(vals)
-            assert cell["recoverable"] == (min(vals) == max(vals))
 
-        # 极值矩阵中的对应格确实达到界，且矩阵整体可行
-        first_pos = (result["cells"][0]["row"], result["cells"][0]["col"])
-        assert (
-            result["minimizer_matrix"][first_pos[0]][first_pos[1]]
-            == result["cells"][0]["min"]
+def _random_constraint_sets(matrix, legal_matrices, rng, count):
+    rows, cols = len(matrix), len(matrix[0])
+    # 收集每个键在合法矩阵中实际出现过的合计值，保证候选值“看起来可能”。
+    achievable = {}
+    for candidate in legal_matrices:
+        row_sums = [sum(candidate[i]) for i in range(rows)]
+        col_sums = [sum(candidate[i][j] for i in range(rows)) for j in range(cols)]
+        for i, value in enumerate(row_sums):
+            achievable.setdefault((ROW, i), set()).add(value)
+        for j, value in enumerate(col_sums):
+            achievable.setdefault((COL, j), set()).add(value)
+        achievable.setdefault((GRAND, 0), set()).add(sum(row_sums))
+
+    keys = list(achievable)
+    for _ in range(count):
+        constraints = {}
+        for key in keys:
+            if rng.random() < 0.5:
+                constraints[key] = rng.choice(sorted(achievable[key]))
+        yield constraints
+
+
+def test_brute_force_cross_validation():
+    rng = random.Random(20261111)
+    checked = 0
+    for trial in range(40):
+        rows = rng.randint(1, 3)
+        cols = rng.randint(1, 3)
+        matrix = [[rng.randint(0, 9) for _ in range(cols)] for _ in range(rows)]
+        legal = _all_legal_rounded_matrices(matrix)
+        assert legal, "取整问题无约束时必然存在合法矩阵"
+
+        # 无约束必须可行
+        rounded, reasons = solver.solve(matrix)
+        assert reasons == [] and rounded in legal
+
+        for constraints in _random_constraint_sets(matrix, legal, rng, 8):
+            expected = _brute_force_feasible(legal, constraints)
+            rounded, reasons = solver.solve(matrix, constraints)
+            assert (rounded is not None) == expected, (
+                f"trial={trial} matrix={matrix} constraints={constraints} "
+                f"expected={expected} reasons={reasons}"
+            )
+            if expected:
+                _assert_matrix_valid(matrix, rounded)
+                _assert_constraints_met(rounded, constraints)
+            checked += 1
+    assert checked >= 100
+
+
+def test_twelve_by_twelve_performance():
+    rng = random.Random(42)
+    matrix = [[rng.randint(0, 999) for _ in range(12)] for _ in range(12)]
+    # 固定前 4 行向上取整，其余行列与总计由网络自行平衡
+    constraints = {
+        (ROW, i): solver.ceil5(sum(matrix[i]))
+        for i in range(4)
+        if solver.floor5(sum(matrix[i])) != solver.ceil5(sum(matrix[i]))
+    }
+    rounded, reasons = solver.solve(matrix, constraints)
+    assert reasons == []
+    _assert_matrix_valid(matrix, rounded)
+    _assert_constraints_met(rounded, constraints)
+
+
+# ---------------------------------------------------------------------------
+# 辅助断言
+# ---------------------------------------------------------------------------
+
+def _assert_matrix_valid(original, rounded):
+    rows, cols = len(original), len(original[0])
+    assert len(rounded) == rows and all(len(r) == cols for r in rounded)
+    for i in range(rows):
+        for j in range(cols):
+            low, high = solver.rounding_options(original[i][j])
+            assert low <= rounded[i][j] <= high
+            assert rounded[i][j] % 5 == 0
+    for i in range(rows):
+        lo, hi = solver.rounding_options(sum(original[i]))
+        assert lo <= sum(rounded[i]) <= hi
+    for j in range(cols):
+        lo, hi = solver.rounding_options(
+            sum(original[i][j] for i in range(rows))
         )
-        assert (
-            result["maximizer_matrix"][first_pos[0]][first_pos[1]]
-            == result["cells"][0]["max"]
+        assert lo <= sum(rounded[i][j] for i in range(rows)) <= hi
+    lo, hi = solver.rounding_options(sum(sum(r) for r in original))
+    assert lo <= sum(sum(r) for r in rounded) <= hi
+
+
+def _assert_constraints_met(rounded, constraints):
+    rows, cols = len(rounded), len(rounded[0])
+    row_sums = [sum(rounded[i]) for i in range(rows)]
+    col_sums = [sum(rounded[i][j] for i in range(rows)) for j in range(cols)]
+    grand = sum(row_sums)
+    for (kind, pos), value in constraints.items():
+        actual = (
+            row_sums[pos] if kind == ROW
+            else col_sums[pos] if kind == COL
+            else grand
         )
-    assert checked >= 20
-
-
-def test_brute_force_on_infeasible():
-    """随机矩阵 + 随机合计：solver 判无解当且仅当枚举无可行解。"""
-    import random
-
-    rng = random.Random(424242)
-    for seed in range(30):
-        rng.seed(seed)
-        rows = cols = 2
-        matrix = [
-            [rng.randint(0, 4) if rng.random() < 0.4 else None for _ in range(cols)]
-            for _ in range(rows)
-        ]
-        if not any(v is None for row in matrix for v in row):
-            matrix[0][0] = None
-        row_totals = [rng.randint(0, 10) for _ in range(rows)]
-        col_totals = [rng.randint(0, 10) for _ in range(cols)]
-        brute = _feasible_assignments(matrix, row_totals, col_totals)
-        try:
-            result = solver.analyze(matrix, row_totals, col_totals)
-            assert brute, "solver 认为可行，但暴力枚举无解"
-            for cell in result["cells"]:
-                pos = (cell["row"], cell["col"])
-                vals = [sol[pos] for sol in brute]
-                assert cell["min"] == min(vals)
-                assert cell["max"] == max(vals)
-        except solver.SuppressionConflict:
-            assert not brute, "solver 判无解，但暴力枚举存在可行解"
-
-
-def test_max_size_12x12_runs():
-    import random
-
-    rng = random.Random(7)
-    n = 12
-    full = [[rng.randint(0, 99) for _ in range(n)] for _ in range(n)]
-    row_totals = [sum(r) for r in full]
-    col_totals = [sum(full[i][j] for i in range(n)) for j in range(n)]
-    matrix = [[v for v in row] for row in full]
-    for i in range(n):
-        for j in range(n):
-            if (i + j) % 2 == 0:
-                matrix[i][j] = None
-    result = solver.analyze(matrix, row_totals, col_totals)
-    assert result["dimensions"] == {"rows": 12, "cols": 12}
-    assert result["hidden_count"] == 72
-    for m in (result["minimizer_matrix"], result["maximizer_matrix"]):
-        assert all(sum(m[i]) == row_totals[i] for i in range(n))
-        assert all(
-            sum(m[i][j] for i in range(n)) == col_totals[j] for j in range(n)
-        )
-
-
-def test_validation_errors_solver_level():
-    # solver 被独立调用时，结构性/类型性输入问题同样以冲突异常拒绝
-    with pytest.raises(solver.SuppressionConflict):
-        solver.analyze([[0]] * 13, [0] * 13, [0])
-    with pytest.raises(solver.SuppressionConflict):
-        solver.analyze([[-1, None]], [0], [0, 0])
-    with pytest.raises(solver.SuppressionConflict):
-        solver.analyze([[1, None]], [0, 1], [1, 0])
-    with pytest.raises(solver.SuppressionConflict):
-        solver.analyze([[True, None]], [1], [1, 0])
-
-
-def test_schema_rejects_malformed_inputs():
-    """Pydantic 层负责形状/类型/负数，统一返回 ValueError（API 中即 422）。"""
-    import pytest as _pt
-
-    from app.schemas import SuppressionRequest
-
-    bad_cases = [
-        {"matrix": [[0]] * 13, "row_totals": [0] * 13, "col_totals": [0]},
-        {"matrix": [[1, 2], [3]], "row_totals": [3, 3], "col_totals": [4, 2]},
-        {"matrix": [[1, None]], "row_totals": [1], "col_totals": [1]},
-        {"matrix": [[-1, 0]], "row_totals": [1], "col_totals": [1, 0]},
-        {"matrix": [[1.5, 0]], "row_totals": [1], "col_totals": [1, 0]},
-        {"matrix": [[True, 0]], "row_totals": [1], "col_totals": [1, 0]},
-        {"matrix": [[]], "row_totals": [0], "col_totals": []},
-    ]
-    for payload in bad_cases:
-        with _pt.raises(Exception):
-            SuppressionRequest(**payload)
+        assert actual == value

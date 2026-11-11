@@ -1,88 +1,75 @@
-"""区间反推核查的核心算法。
+"""取整矩阵可行性求解的核心算法。
 
 问题建模
 --------
-给定 r x c 非负整数计数矩阵，部分格子被遮盖（null），同时公开：
+给定 m x n 非负整数计数矩阵 ``A``（乡镇为行、年龄组为列），每份对外
+发布的取整表 ``B`` 必须满足：
 
-* 每一行的行合计 row_totals；
-* 每一列的列合计 col_totals。
+1. 格值只能向下或向上取到最近的 5 的倍数：
+   ``B[i][j] ∈ {floor5(A[i][j]), ceil5(A[i][j])}``；
+   原数已是 5 的倍数时二者相等，该格取值唯一。
+2. 每一行合计、每一列合计、全表总计同样只能是对应原合计的向下或向上
+   最近 5 的倍数（原合计已是 5 的倍数时唯一）。
+3. 发布员分批确认的行/列/总计合计是附加的等式约束。
 
-设第 k 个隐藏格的取值为变量 x_k（非负整数）。所有隐藏格与固定格必须
-同时满足全部行/列合计等式，这是一个整数运输可行性问题。
+令余数 ``r[i][j] = A[i][j] mod 5``、基数 ``F[i][j] = floor5(A[i][j])``，
+引入 0-1 变量 ``x[i][j]``（余数为 0 的格固定为 0）：
 
-运输问题的约束矩阵是全幺模矩阵（totally unimodular），且右侧为整数，
-因此线性规划松弛的最优顶点天然是整数解。本模块用 scipy 的 HiGHS LP
-求解器分别对每个隐藏格做 min / max 两次求解：
+    B[i][j] = F[i][j] + 5 * x[i][j]
 
-* 最小值 == 最大值 -> 该格可被公开合计唯一反推（可还原）；
-* 否则只暴露该格的取值闭区间。
+第 i 行向上取整的格子数记为 ``k_i``，则该行合计为
+``base_i + 5*k_i``（``base_i = Σ_j F[i][j]``）。由“行合计必须是原行
+合计的最近 5 倍数”可推出 ``k_i`` 的整数上下界；列与全表同理。于是
+问题转化为二分图上的**带下界可行流**：
 
-为在无解时给出结构化的冲突说明，另实现一个 Dinic 最大流：隐藏格作为
-行节点到列节点之间容量无限的运输边，最大流达不到总计数即无解，并可
-由最小割构造 Hall 型冲突见证（某些乡镇的需求量大于对应年龄组的供给量）。
+    source -> 行节点   容量区间 [k_min_i, k_max_i]（被确认时缩为定值）
+    行节点 -> 列节点   容量区间 [0, 1]（仅余数非 0 的格有边）
+    列节点 -> sink     容量区间 [k_min_j, k_max_j]（被确认时缩为定值）
+    sink -> source     容量区间 [k_min_G, k_max_G]（总计约束）
+
+带下界边按标准手法转换为超级源/超级汇的最大流问题，用自实现的
+Dinic 判定可行性并读取每条行列边的实际流量，恢复出完整取整矩阵。
+容量均为整数，Dinic 给出的最大流天然为整数流。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
-from scipy.optimize import linprog
-from scipy.sparse import coo_matrix
+ROW = "row"
+COL = "col"
+GRAND = "grand"
+
+# 约束键：(种类, 位置)；总计只有一个，位置固定为 0。
+ConstraintKey = tuple[str, int]
 
 
-class SuppressionConflict(ValueError):
-    """约束无解时抛出，携带面向用户的冲突说明。"""
-
-    def __init__(self, reasons: list[str], witness: dict | None = None):
-        super().__init__("; ".join(reasons) if reasons else "infeasible constraints")
-        self.reasons = reasons
-        self.witness = witness
-
-
-@dataclass(frozen=True)
-class HiddenCell:
-    index: int  # 变量序号
-    row: int
-    col: int
+class RoundingError(ValueError):
+    """输入本身不合法（如合计不是 5 的倍数）时抛出。"""
 
 
 # ---------------------------------------------------------------------------
-# 输入检查
+# 取整基础函数
 # ---------------------------------------------------------------------------
 
-def validate_request(
-    matrix: list[list[int | None]],
-    row_totals: list[int],
-    col_totals: list[int],
-) -> tuple[int, int]:
-    """防御性尺寸校验。
+def floor5(value: int) -> int:
+    """向下取到最近的 5 的倍数。"""
+    return (value // 5) * 5
 
-    API 入口的 Pydantic 模型（schemas.SuppressionRequest）已完成严格的
-    形状、类型与非负校验并返回 422；这里保留同构检查，保证 solver 可被
-    独立调用。
-    """
-    if not matrix or not matrix[0]:
-        raise SuppressionConflict(["matrix 不能为空矩阵"])
-    rows = len(matrix)
-    cols = len(matrix[0])
-    if rows > 12 or cols > 12:
-        raise SuppressionConflict(["matrix 尺寸不能超过 12x12"])
-    if any(len(row) != cols for row in matrix):
-        raise SuppressionConflict(["matrix 各行长度不一致"])
-    if len(row_totals) != rows or len(col_totals) != cols:
-        raise SuppressionConflict(["row_totals/col_totals 长度与矩阵尺寸不一致"])
-    if any(
-        (v is not None) and (not isinstance(v, int) or isinstance(v, bool) or v < 0)
-        for row in matrix
-        for v in row
-    ) or any(v < 0 for v in row_totals + col_totals):
-        raise SuppressionConflict(["所有计数与合计必须为非负整数"])
-    return rows, cols
+
+def ceil5(value: int) -> int:
+    """向上取到最近的 5 的倍数；已是 5 的倍数时原值保留。"""
+    quotient, remainder = divmod(value, 5)
+    return value if remainder == 0 else (quotient + 1) * 5
+
+
+def rounding_options(value: int) -> tuple[int, int]:
+    """返回单格/单合计的合法取整区间 (下界, 上界)，均为 5 的倍数。"""
+    return floor5(value), ceil5(value)
 
 
 # ---------------------------------------------------------------------------
-# Dinic 最大流：可行性判定与冲突见证
+# Dinic 最大流
 # ---------------------------------------------------------------------------
 
 class _Edge:
@@ -100,12 +87,12 @@ class _Dinic:
         self.level = [-1] * n
         self.it = [0] * n
 
-    def add_edge(self, fr: int, to: int, cap: int) -> None:
+    def add_edge(self, fr: int, to: int, cap: int) -> _Edge:
         forward = _Edge(to, len(self.g[to]), cap)
         backward = _Edge(fr, len(self.g[fr]), 0)
         self.g[fr].append(forward)
         self.g[to].append(backward)
-
+        return forward
     def _bfs(self, s: int, t: int) -> bool:
         self.level = [-1] * len(self.g)
         self.level[s] = 0
@@ -145,332 +132,344 @@ class _Dinic:
                 flow += f
         return flow
 
-    def reachable_from(self, s: int) -> list[bool]:
-        seen = [False] * len(self.g)
-        seen[s] = True
-        stack = [s]
-        while stack:
-            v = stack.pop()
-            for e in self.g[v]:
-                if e.cap > 0 and not seen[e.to]:
-                    seen[e.to] = True
-                    stack.append(e.to)
-        return seen
+
+# ---------------------------------------------------------------------------
+# 输入校验与区间计算
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _LineSpec:
+    """一行/一列/总计的向上取整计数区间。"""
+
+    base: int       # 各格 floor5 之和（5 的倍数）
+    k_min: int      # 满足合计下界所需的最少向上取整格数
+    k_max: int      # 满足合计上界允许的最多向上取整格数
+    low_total: int  # 合法合计下界 floor5(原合计)
+    high_total: int  # 合法合计上界 ceil5(原合计)
 
 
-def _maxflow_feasibility(
-    rows: int,
-    cols: int,
-    hidden: list[HiddenCell],
-    row_demand: list[int],
-    col_supply: list[int],
-    total: int,
-) -> dict | None:
-    """返回 None 表示可行；否则返回冲突见证字典。
+def _line_spec(base: int, residue_sum: int, non_zero_cells: int,
+               original_sum: int) -> _LineSpec:
+    """计算一行/一列/总计的向上取整格数区间。
 
-    网络：source -> 行节点（容量=该行列合计扣除固定格后的剩余需求），
-    行节点 -> 列节点（仅隐藏格之间有边，容量无限），列节点 -> sink
-    （容量=该列剩余供给）。
+    合计只能是原合计的 floor5 或 ceil5：
+
+    * ``base + 5*k_min = floor5(原合计)``，故 ``k_min = 余数和 // 5``；
+    * 余数和不是 5 的倍数时允许再向上一格，``k_max = k_min + 1``，对应
+      ``ceil5(原合计)``；余数和恰为 5 的倍数时上下界重合（合计唯一）；
+    * ``non_zero_cells`` 仅用于防御性断言：``k_max`` 不可能超过可用的
+      余数非 0 格数。
     """
-    source = 0
-    row_base = 1
-    col_base = row_base + rows
-    sink = col_base + cols
-    dinic = _Dinic(sink + 1)
-    inf = total + 1
-
-    for i, d in enumerate(row_demand):
-        if d > 0:
-            dinic.add_edge(source, row_base + i, d)
-    for j, s in enumerate(col_supply):
-        if s > 0:
-            dinic.add_edge(col_base + j, sink, s)
-    for h in hidden:
-        dinic.add_edge(row_base + h.row, col_base + h.col, inf)
-
-    flow = dinic.max_flow(source, sink, total)
-    if flow == total:
-        return None
-
-    reachable = dinic.reachable_from(source)
-    r_subset = [
-        i for i in range(rows) if reachable[row_base + i]
-    ]
-    # 与 R 之间存在隐藏格运输边的列即邻接列 N(R)；最小割保证 N(R) 全部
-    # 可达（若不可达则该运输边横跨割集、容量为 inf，与有限最小割矛盾）。
-    neighbor_cols = sorted({h.col for h in hidden if h.row in set(r_subset)})
-    demand = sum(row_demand[i] for i in r_subset)
-    neighbor_supply = sum(col_supply[j] for j in neighbor_cols)
-    return {
-        "max_flow": flow,
-        "required_flow": total,
-        "row_subset": r_subset,
-        "neighbor_cols": neighbor_cols,
-        "subset_demand": demand,
-        "neighbor_supply": neighbor_supply,
-    }
-
-
-# ---------------------------------------------------------------------------
-# LP 求解
-# ---------------------------------------------------------------------------
-
-def _build_constraints(
-    rows: int,
-    cols: int,
-    hidden: list[HiddenCell],
-    row_demand: list[int],
-    col_supply: list[int],
-):
-    """构造 A_eq x = b_eq：行等式与列等式（可能含冗余行，HiGHS 可处理）。"""
-    n = len(hidden)
-    data: list[float] = []
-    row_idx: list[int] = []
-    col_idx: list[int] = []
-    b: list[int] = []
-
-    eq_row = 0
-    for h in hidden:
-        row_idx.append(h.row)
-        col_idx.append(h.index)
-        data.append(1.0)
-    b.extend(row_demand)
-    eq_row += rows
-
-    for h in hidden:
-        row_idx.append(eq_row + h.col)
-        col_idx.append(h.index)
-        data.append(1.0)
-    b.extend(col_supply)
-
-    a_eq = coo_matrix((data, (row_idx, col_idx)), shape=(rows + cols, n)).tocsr()
-    return a_eq, np.array(b, dtype=float)
-
-
-def _round_integer(value: float) -> int:
-    r = int(round(value))
-    if abs(value - r) > max(1e-6, 1e-9 * abs(value)):
-        raise SuppressionConflict(
-            [f"求解器返回非整数解 {value}，请检查输入规模或联系维护者"]
+    low_total, high_total = rounding_options(original_sum)
+    k_min = residue_sum // 5
+    k_max = k_min + (1 if residue_sum % 5 else 0)
+    if k_max > non_zero_cells:
+        raise RoundingError(
+            f"向上取整格数上界 {k_max} 超过余数非 0 格数 {non_zero_cells}"
         )
-    return r
+    return _LineSpec(base, k_min, k_max, low_total, high_total)
 
 
-def _solve_lp(c: np.ndarray, a_eq, b_eq: np.ndarray) -> np.ndarray:
-    result = linprog(
-        c=c,
-        A_eq=a_eq,
-        b_eq=b_eq,
-        bounds=(0, None),
-        method="highs",
-    )
-    if not result.success:
-        # 正常情况下最大流已先行判定可行，走到这里属于求解器层面的异常。
-        raise SuppressionConflict(
-            [f"线性规划求解失败（status={result.status}）：{result.message}"]
-        )
-    return result.x
-
-
-def _fill_matrix(
-    base: list[list[int | None]],
-    hidden: list[HiddenCell],
-    values: np.ndarray,
-) -> list[list[int]]:
-    matrix = [row[:] for row in base]
-    for h in hidden:
-        matrix[h.row][h.col] = _round_integer(float(values[h.index]))
-    return matrix
-
-
-def _verify_solution(
-    matrix: list[list[int]],
-    row_totals: list[int],
-    col_totals: list[int],
-) -> None:
+def validate_matrix(matrix: list[list[int]]) -> tuple[int, int]:
+    """独立调用 solver 时的防御性尺寸与类型校验。"""
+    if not matrix or not matrix[0]:
+        raise RoundingError("matrix 不能为空矩阵")
     rows = len(matrix)
     cols = len(matrix[0])
-    for i in range(rows):
-        if sum(matrix[i]) != row_totals[i]:
-            raise SuppressionConflict(
-                [f"内部校验失败：第 {i} 行合计与公开值不一致"]
-            )
-    for j in range(cols):
-        if sum(matrix[i][j] for i in range(rows)) != col_totals[j]:
-            raise SuppressionConflict(
-                [f"内部校验失败：第 {j} 列合计与公开值不一致"]
-            )
-    if any(v < 0 for row in matrix for v in row):
-        raise SuppressionConflict(["内部校验失败：解中出现负数"])
+    if rows > 12 or cols > 12:
+        raise RoundingError("matrix 尺寸不能超过 12x12")
+    if any(len(row) != cols for row in matrix):
+        raise RoundingError("matrix 各行长度不一致")
+    for i, row in enumerate(matrix):
+        for j, value in enumerate(row):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RoundingError(f"matrix[{i}][{j}] 必须是非负整数")
+    return rows, cols
+
+
+def _check_constraint_value(key: ConstraintKey, value: object, spec: _LineSpec,
+                            label: str) -> list[str]:
+    """校验单个确认合计，返回冲突原因列表（空列表表示通过）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return [f"{label}合计必须是整数，收到 {value!r}"]
+    if value < 0:
+        return [f"{label}合计不能为负数：{value}"]
+    if value % 5 != 0:
+        return [f"{label}合计必须是 5 的倍数：{value}"]
+    if not spec.low_total <= value <= spec.high_total:
+        return [
+            f"{label}合计 {value} 超出该合计的合法取整区间 "
+            f"[{spec.low_total}, {spec.high_total}]（原合计只能向下或向上 "
+            "取到最近的 5 的倍数）"
+        ]
+    return []
 
 
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
-def analyze(
-    matrix: list[list[int | None]],
-    row_totals: list[int],
-    col_totals: list[int],
-) -> dict:
-    """执行完整核查，返回可直接序列化为 API 响应的字典。
+def solve(
+    matrix: list[list[int]],
+    constraints: dict[ConstraintKey, int] | None = None,
+) -> tuple[list[list[int]] | None, list[str]]:
+    """判定约束是否可行，可行时返回一张满足全部要求的取整矩阵。
 
-    无解时抛出 :class:`SuppressionConflict`。
+    :param matrix: 原始非负整数计数矩阵（最多 12x12）
+    :param constraints: 确认合计映射，键为 ``("row", i)`` / ``("col", j)``
+        / ``("grand", 0)``，值为 5 的倍数合计
+    :returns: ``(取整矩阵, [])`` 可行；``(None, 冲突原因列表)`` 无解
     """
-    rows, cols = validate_request(matrix, row_totals, col_totals)
+    constraints = constraints or {}
+    rows, cols = validate_matrix(matrix)
 
-    row_sum = sum(row_totals)
-    col_sum = sum(col_totals)
-    if row_sum != col_sum:
-        raise SuppressionConflict([
-            f"行合计之和（{row_sum}）与列合计之和（{col_sum}）不相等，"
-            "任何矩阵都无法同时满足两组合计"
-        ])
-    total = row_sum
+    floors = [[floor5(v) for v in row] for row in matrix]
+    residues = [[v % 5 for v in row] for row in matrix]
 
-    fixed_row = [0] * rows
-    fixed_col = [0] * cols
-    hidden: list[HiddenCell] = []
-    for i, row in enumerate(matrix):
-        for j, v in enumerate(row):
-            if v is None:
-                hidden.append(HiddenCell(index=len(hidden), row=i, col=j))
-            else:
-                fixed_row[i] += v
-                fixed_col[j] += v
+    row_base = [sum(floors[i]) for i in range(rows)]
+    col_base = [sum(floors[i][j] for i in range(rows)) for j in range(cols)]
+    row_res = [sum(residues[i]) for i in range(rows)]
+    col_res = [sum(residues[i][j] for i in range(rows)) for j in range(cols)]
+    original_rows = [sum(matrix[i]) for i in range(rows)]
+    original_cols = [sum(matrix[i][j] for i in range(rows)) for j in range(cols)]
+    grand_base = sum(row_base)
+    grand_res = sum(row_res)
+    original_grand = sum(original_rows)
 
-    row_demand = [row_totals[i] - fixed_row[i] for i in range(rows)]
-    col_supply = [col_totals[j] - fixed_col[j] for j in range(cols)]
+    row_nonzero = [
+        sum(1 for j in range(cols) if residues[i][j] > 0) for i in range(rows)
+    ]
+    col_nonzero = [
+        sum(1 for i in range(rows) if residues[i][j] > 0) for j in range(cols)
+    ]
+    grand_nonzero = sum(row_nonzero)
 
-    reasons: list[str] = []
-    for i, d in enumerate(row_demand):
-        if d < 0:
-            reasons.append(
-                f"第 {i} 行固定格之和（{fixed_row[i]}）已超过公开行合计"
-                f"（{row_totals[i]}）"
-            )
-    for j, s in enumerate(col_supply):
-        if s < 0:
-            reasons.append(
-                f"第 {j} 列固定格之和（{fixed_col[j]}）已超过公开列合计"
-                f"（{col_totals[j]}）"
-            )
-    if reasons:
-        raise SuppressionConflict(reasons)
-
-    # 固定格之外、必须由隐藏格承担的总流量（行、列两侧应相等）。
-    hidden_total = sum(row_demand)
-    if hidden_total != sum(col_supply) or any(d < 0 for d in row_demand + col_supply):
-        # 负值已在上面收集；此处为防御性总量检查。
-        raise SuppressionConflict(reasons or ["隐藏格需要满足的总流量不一致"])
-
-    # 没有隐藏格：直接核对固定矩阵是否等于公开合计。
-    if not hidden:
-        fixed_matrix: list[list[int]] = [
-            [v for v in row] for row in matrix  # type: ignore[arg-type]
-        ]
-        _verify_solution(fixed_matrix, row_totals, col_totals)
-        return {
-            "status": "feasible",
-            "dimensions": {"rows": rows, "cols": cols},
-            "grand_total": total,
-            "hidden_count": 0,
-            "recoverable_count": 0,
-            "cells": [],
-        }
-
-    witness = _maxflow_feasibility(
-        rows, cols, hidden, row_demand, col_supply, hidden_total
+    row_specs = [
+        _line_spec(row_base[i], row_res[i], row_nonzero[i], original_rows[i])
+        for i in range(rows)
+    ]
+    col_specs = [
+        _line_spec(col_base[j], col_res[j], col_nonzero[j], original_cols[j])
+        for j in range(cols)
+    ]
+    grand_spec = _line_spec(
+        grand_base, grand_res, grand_nonzero, original_grand
     )
-    if witness is not None:
-        r_set = ", ".join(str(i) for i in witness["row_subset"]) or "（空集）"
-        c_set = (
-            ", ".join(str(j) for j in witness["neighbor_cols"]) or "（无邻接列）"
+    # 约束 -> 固定的向上取整格数；同时收集非法约束原因。
+    fixed_row: dict[int, int] = {}
+    fixed_col: dict[int, int] = {}
+    fixed_grand: int | None = None
+    reasons: list[str] = []
+
+    for (kind, pos), value in constraints.items():
+        if kind == ROW:
+            if not 0 <= pos < rows:
+                reasons.append(f"行合计下标 {pos} 超出矩阵范围（共 {rows} 行）")
+                continue
+            label = f"第 {pos} 行"
+            spec = row_specs[pos]
+            errs = _check_constraint_value((kind, pos), value, spec, label)
+            if errs:
+                reasons.extend(errs)
+                continue
+            fixed_row[pos] = (value - spec.base) // 5
+        elif kind == COL:
+            if not 0 <= pos < cols:
+                reasons.append(f"列合计下标 {pos} 超出矩阵范围（共 {cols} 列）")
+                continue
+            label = f"第 {pos} 列"
+            spec = col_specs[pos]
+            errs = _check_constraint_value((kind, pos), value, spec, label)
+            if errs:
+                reasons.extend(errs)
+                continue
+            fixed_col[pos] = (value - spec.base) // 5
+        elif kind == GRAND:
+            if pos != 0:
+                reasons.append(f"总计约束位置只能是 0，收到 {pos}")
+                continue
+            errs = _check_constraint_value((kind, pos), value, grand_spec, "全表")
+            if errs:
+                reasons.extend(errs)
+                continue
+            fixed_grand = (value - grand_spec.base) // 5
+        else:
+            reasons.append(f"未知约束种类：{kind!r}")
+
+    if reasons:
+        return None, reasons
+
+    # ------------------------------------------------------------------
+    # 构造带下界可行流网络
+    # ------------------------------------------------------------------
+    source = 0
+    row_node = lambda i: 1 + i
+    col_node = lambda j: 1 + rows + j
+    sink = 1 + rows + cols
+    super_source = sink + 1
+    super_sink = sink + 2
+    dinic = _Dinic(super_sink + 1)
+    # balance[v] = 入边下界之和 - 出边下界之和
+    balance = [0] * (super_sink + 1)
+    # 记录每条 行->列 边的前向边对象与转换后容量，供读取实际流量。
+    cell_edges: dict[tuple[int, int], tuple[_Edge, int]] = {}
+
+    def add_lb_edge(fr: int, to: int, lower: int, upper: int) -> _Edge:
+        if upper < lower:
+            # 理论上不会发生，兜底下界合法性。
+            raise RoundingError(
+                f"边 {fr}->{to} 的下界 {lower} 大于上界 {upper}"
+            )
+        edge = dinic.add_edge(fr, to, upper - lower)
+        balance[fr] -= lower
+        balance[to] += lower
+        return edge
+
+    # source -> 行
+    for i in range(rows):
+        if i in fixed_row:
+            k = fixed_row[i]
+            add_lb_edge(source, row_node(i), k, k)
+        else:
+            add_lb_edge(
+                source, row_node(i), row_specs[i].k_min, row_specs[i].k_max
+            )
+
+    # 行 -> 列（余数为 0 的格无法向上取整，不建边）
+    for i in range(rows):
+        for j in range(cols):
+            if residues[i][j] > 0:
+                edge = add_lb_edge(row_node(i), col_node(j), 0, 1)
+                cell_edges[(i, j)] = (edge, 1)
+
+    # 列 -> sink
+    for j in range(cols):
+        if j in fixed_col:
+            k = fixed_col[j]
+            add_lb_edge(col_node(j), sink, k, k)
+        else:
+            add_lb_edge(
+                col_node(j), sink, col_specs[j].k_min, col_specs[j].k_max
+            )
+
+    # sink -> source：总计约束（环流边）
+    if fixed_grand is not None:
+        add_lb_edge(sink, source, fixed_grand, fixed_grand)
+    else:
+        add_lb_edge(sink, source, grand_spec.k_min, grand_spec.k_max)
+
+    required = 0
+    for v, bal in enumerate(balance):
+        if bal > 0:
+            dinic.add_edge(super_source, v, bal)
+            required += bal
+        elif bal < 0:
+            dinic.add_edge(v, super_sink, -bal)
+
+    if required > 0:
+        flow = dinic.max_flow(super_source, super_sink, required)
+        if flow < required:
+            return None, [
+                "不存在同一张取整表能同时满足本批与已确认的全部合计："
+                f"带下界可行流检验未通过（最大流 {flow} < 所需流量 {required}）"
+            ]
+
+    # ------------------------------------------------------------------
+    # 读取流量并恢复取整矩阵
+    # ------------------------------------------------------------------
+    rounded = [row[:] for row in floors]
+    for (i, j), (edge, original_cap) in cell_edges.items():
+        ups = original_cap - edge.cap  # 该边实际流量（下界为 0）
+        # 防御性检查：流量只能是 0/1。
+        if ups not in (0, 1):
+            return None, [f"内部错误：格 ({i},{j}) 取得非二元流量 {ups}"]
+        rounded[i][j] = floors[i][j] + 5 * ups
+
+    problems = _verify(matrix, rounded, constraints, row_specs, col_specs,
+                       grand_spec, fixed_row, fixed_col, fixed_grand)
+    if problems:
+        return None, problems
+    return rounded, []
+
+
+def _verify(
+    matrix: list[list[int]],
+    rounded: list[list[int]],
+    constraints: dict[ConstraintKey, int],
+    row_specs: list[_LineSpec],
+    col_specs: list[_LineSpec],
+    grand_spec: _LineSpec,
+    fixed_row: dict[int, int],
+    fixed_col: dict[int, int],
+    fixed_grand: int | None,
+) -> list[str]:
+    """输出前复核：格值合法、行列总计均为原合计的最近 5 倍数、约束满足。"""
+    rows = len(matrix)
+    cols = len(matrix[0])
+    problems: list[str] = []
+
+    for i in range(rows):
+        for j in range(cols):
+            low, high = rounding_options(matrix[i][j])
+            if not low <= rounded[i][j] <= high or rounded[i][j] % 5 != 0:
+                problems.append(
+                    f"内部校验失败：格 ({i},{j}) 取整值 {rounded[i][j]} "
+                    f"不在合法区间 [{low}, {high}]"
+                )
+
+    for i in range(rows):
+        total = sum(rounded[i])
+        spec = row_specs[i]
+        if not spec.low_total <= total <= spec.high_total:
+            problems.append(
+                f"内部校验失败：第 {i} 行合计 {total} 超出合法区间 "
+                f"[{spec.low_total}, {spec.high_total}]"
+            )
+        if i in fixed_row and (ROW, i) in constraints and total != constraints[(ROW, i)]:
+            problems.append(
+                f"内部校验失败：第 {i} 行合计 {total} 不等于确认值 "
+                f"{constraints[(ROW, i)]}"
+            )
+
+    for j in range(cols):
+        total = sum(rounded[i][j] for i in range(rows))
+        spec = col_specs[j]
+        if not spec.low_total <= total <= spec.high_total:
+            problems.append(
+                f"内部校验失败：第 {j} 列合计 {total} 超出合法区间 "
+                f"[{spec.low_total}, {spec.high_total}]"
+            )
+        if j in fixed_col and (COL, j) in constraints and total != constraints[(COL, j)]:
+            problems.append(
+                f"内部校验失败：第 {j} 列合计 {total} 不等于确认值 "
+                f"{constraints[(COL, j)]}"
+            )
+
+    grand = sum(sum(row) for row in rounded)
+    if not grand_spec.low_total <= grand <= grand_spec.high_total:
+        problems.append(
+            f"内部校验失败：全表总计 {grand} 超出合法区间 "
+            f"[{grand_spec.low_total}, {grand_spec.high_total}]"
         )
-        reasons = [
-            "不存在满足全部公开合计的非负整数矩阵：最大流可行性检验未通过",
-            f"行子集 [{r_set}] 的隐藏格需求合计为 {witness['subset_demand']}，"
-            f"但这些行的隐藏格只能进入列 [{c_set}]，其可承接供给仅为 "
-            f"{witness['neighbor_supply']}（Hall 条件被破坏：需求 > 邻接供给）",
-            f"最大流 {witness['max_flow']} < 隐藏格所需总流量 "
-            f"{witness['required_flow']}",
-        ]
-        raise SuppressionConflict(reasons, witness=witness)
+    if fixed_grand is not None and (GRAND, 0) in constraints:
+        if grand != constraints[(GRAND, 0)]:
+            problems.append(
+                f"内部校验失败：全表总计 {grand} 不等于确认值 "
+                f"{constraints[(GRAND, 0)]}"
+            )
+    return problems
 
-    a_eq, b_eq = _build_constraints(rows, cols, hidden, row_demand, col_supply)
-    n = len(hidden)
 
-    cell_results: list[dict] = []
-    recoverable_count = 0
-    # 先求一版零目标解，作为未单独触发极值时的兜底可行矩阵。
-    fallback = _solve_lp(np.zeros(n), a_eq, b_eq)
-    min_matrix = max_matrix = None
-
-    for h in hidden:
-        c = np.zeros(n)
-        c[h.index] = 1.0
-
-        x_min = _solve_lp(c.copy(), a_eq, b_eq)
-        min_value = _round_integer(float(x_min[h.index]))
-
-        x_max = _solve_lp(-c, a_eq, b_eq)
-        max_value = _round_integer(float(x_max[h.index]))
-
-        if min_value > max_value:  # 防御性检查，正常不会发生
-            raise SuppressionConflict([
-                f"隐藏格 ({h.row}, {h.col}) 求得最小值 {min_value} 大于最大值 "
-                f"{max_value}，求解异常"
-            ])
-
-        recoverable = min_value == max_value
-        if recoverable:
-            recoverable_count += 1
-
-        cell_results.append(
-            {
-                "row": h.row,
-                "col": h.col,
-                "min": min_value,
-                "max": max_value,
-                "recoverable": recoverable,
-            }
-        )
-
-        # 用第一个变量的极值解固化完整矩阵，保证矩阵真实可达两界。
-        if min_matrix is None:
-            min_matrix = _fill_matrix(matrix, hidden, x_min)
-            max_matrix = _fill_matrix(matrix, hidden, x_max)
-
-    if min_matrix is None or max_matrix is None:
-        filled = _fill_matrix(matrix, hidden, fallback)
-        min_matrix = max_matrix = filled
-
-    _verify_solution(min_matrix, row_totals, col_totals)
-    _verify_solution(max_matrix, row_totals, col_totals)
-
+def legal_totals(matrix: list[list[int]]) -> dict:
+    """给出每张表各行、列、总计的合法取整区间（供查询与排错展示）。"""
+    rows, cols = validate_matrix(matrix)
+    row_ranges = [rounding_options(sum(matrix[i])) for i in range(rows)]
+    col_ranges = [
+        rounding_options(sum(matrix[i][j] for i in range(rows))) for j in range(cols)
+    ]
+    grand_range = rounding_options(sum(sum(row) for row in matrix))
     return {
-        "status": "feasible",
-        "dimensions": {"rows": rows, "cols": cols},
-        "grand_total": total,
-        "hidden_count": n,
-        "recoverable_count": recoverable_count,
-        "cells": cell_results,
-        "minimizer_matrix": min_matrix,
-        "maximizer_matrix": max_matrix,
-    }
-
-
-def fraction_explanation() -> dict:
-    """返回算法说明（供 /method 端点展示）。"""
-    return {
-        "model": "整数运输可行性 / 线性规划（全幺模约束矩阵保证整数顶点）",
-        "variables": "每个 null 格子对应一个非负整数变量",
-        "constraints": "每个变量参与所在行、所在列的合计等式",
-        "solver": "scipy.optimize.linprog(method='highs')，逐变量 min/max 各一次",
-        "feasibility": "Dinic 最大流预判无解并给出 Hall 型冲突见证",
-        "recoverable_rule": "min == max 时该隐藏格取值唯一，可被公开合计反推",
-        "integrality_note": (
-            "问题右侧为整数且运输约束矩阵全幺模，浮点 LP 的最优顶点即为"
-            "整数解；输出前另做整数舍入与合计复核"
-        ),
+        "row_ranges": row_ranges,
+        "col_ranges": col_ranges,
+        "grand_range": grand_range,
     }

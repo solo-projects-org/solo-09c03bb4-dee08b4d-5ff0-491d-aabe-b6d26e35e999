@@ -1,187 +1,281 @@
-"""请求/响应 Pydantic 模型与 Swagger 示例。"""
+"""请求/响应 Pydantic 模型与 Swagger 示例。
+
+内置样例（Swagger UI 可直接选用）：
+
+* ``EX_TABLE``：2x2 原表，每月登记一次、登记后不可修改；
+* ``EX_BATCH_1`` / ``EX_BATCH_2``：两批简报合计，**各自都存在满足它的
+  取整表**（单独提交均会被接受）；
+* ``EX_BATCH_COMBINED``：把两批合计合并到一起，同一张取整表无法同时
+  满足，提交返回 409 冲突。
+"""
 
 from __future__ import annotations
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
 
-# 示例数据（行列序号均从 0 开始，与请求中的矩阵下标一致）---------------
+MONTH_PATTERN = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
-# 示例 1：3x3，4 个隐藏格构成自由块，取值为区间，不可还原。
-EX_RANGE: dict = {
+# ---------------------------------------------------------------------------
+# Swagger 样例数据
+# ---------------------------------------------------------------------------
+
+# 原表（数仓导出的非负整数计数矩阵；行=乡镇，列=年龄组）。
+# 可向上取整的格只有 (0,0)=6 与 (1,1)=7；(0,1)=5、(1,0)=5 已是 5 的倍数。
+# 原总计 23，合法取整区间 [20,25]，即全表最多 1 格向上取整。
+EX_TABLE: dict = {
+    "month": "2026-10",
+    "row_names": ["青山镇", "河口乡"],
+    "col_names": ["0-17岁", "18-59岁"],
     "matrix": [
-        [5, None, None],
-        [None, 3, None],
-        [None, None, 2],
+        [6, 5],
+        [5, 7],
     ],
-    "row_totals": [12, 10, 8],
-    "col_totals": [9, 9, 12],
 }
 
-# 示例 2：3x3，隐藏格被合计完全锁定，全部可还原。
-EX_RECOVERABLE: dict = {
-    "matrix": [
-        [2, None, 3],
-        [None, 4, None],
-        [5, 1, None],
-    ],
-    "row_totals": [10, 10, 9],
-    "col_totals": [9, 10, 10],
+# 第一批合计：青山镇行合计向上取整为 15（原合计 11，区间 [10,15]），
+# 只有格 (0,0) 向上能满足。单独可行：[[10,5],[5,5]]。
+EX_BATCH_1: dict = {
+    "month": "2026-10",
+    "row_totals": [15, None],
+    "col_totals": [None, None],
+    "grand_total": None,
+    "batch_label": "第一批：青山镇行合计向上取整",
 }
 
-# 示例 3：行合计之和与列合计之和不相等，直接冲突。
-EX_TOTAL_CONFLICT: dict = {
-    "matrix": [
-        [1, None],
-        [None, 2],
-    ],
-    "row_totals": [5, 5],
-    "col_totals": [6, 6],
+# 第二批合计：18-59 岁列合计向上取整为 15（原合计 12，区间 [10,15]），
+# 只有格 (1,1) 向上能满足。单独可行：[[5,5],[5,10]]。
+EX_BATCH_2: dict = {
+    "month": "2026-10",
+    "row_totals": [None, None],
+    "col_totals": [None, 15],
+    "grand_total": None,
+    "batch_label": "第二批：18-59岁列合计向上取整",
 }
 
-# 示例 4：总量相等但运输结构无解（第 0 行只能把量送进第 0 列，容量不够）。
-EX_HALL_CONFLICT: dict = {
-    "matrix": [
-        [None, 4],
-        [3, None],
-    ],
-    "row_totals": [10, 7],
-    "col_totals": [5, 12],
+# 合并样例：同时要求格 (0,0) 与格 (1,1) 向上，但全表总计只允许 1 格向上
+# （总计 23 的合法区间为 [20,25]），任何取整表都无法同时满足，返回 409。
+EX_BATCH_COMBINED: dict = {
+    "month": "2026-10",
+    "row_totals": [15, None],
+    "col_totals": [None, 15],
+    "grand_total": None,
+    "batch_label": "合并样例：两批合计互斥（演示 409）",
 }
 
 
-class SuppressionRequest(BaseModel):
-    """核查请求：计数矩阵（null 表示遮盖格）与公开行/列合计。"""
+# ---------------------------------------------------------------------------
+# 请求模型
+# ---------------------------------------------------------------------------
 
-    matrix: list[list[StrictInt | None]] = Field(
-        ...,
-        description=(
-            "最多 12x12 的非负整数计数矩阵；null 表示被遮盖的格子，"
-            "其余数值视为已公开的固定格"
-        ),
+class RegisterTableRequest(BaseModel):
+    """每月登记一次的数仓导出矩阵（登记后不可修改）。"""
+
+    month: str = Field(..., description="所属月份，格式 YYYY-MM", examples=["2026-10"])
+    matrix: list[list[StrictInt]] = Field(
+        ..., description="非负整数计数矩阵，乡镇为行、年龄组为列，最多 12x12"
     )
-    row_totals: list[StrictInt] = Field(
-        ..., description="每一行的公开合计，长度须等于矩阵行数"
+    row_names: list[str] | None = Field(
+        default=None, description="乡镇名称（可选），长度须等于行数；缺省为 row_0、row_1……"
     )
-    col_totals: list[StrictInt] = Field(
-        ..., description="每一列的公开合计，长度须等于矩阵列数"
+    col_names: list[str] | None = Field(
+        default=None, description="年龄组名称（可选），长度须等于列数；缺省为 col_0、col_1……"
     )
+
+    @field_validator("month")
+    @classmethod
+    def _validate_month(cls, value: str) -> str:
+        if not MONTH_PATTERN.match(value):
+            raise ValueError("month 必须是 YYYY-MM 格式且月份在 01..12 之间")
+        return value
 
     @field_validator("matrix")
     @classmethod
-    def _validate_matrix_cells(cls, value):
-        # StrictInt 在联合类型里仍可能放行 bool（bool 是 int 子类），显式拒绝；
-        # 同时统一拦截负数
+    def _validate_cells(cls, value: list[list[int]]) -> list[list[int]]:
+        if not value:
+            raise ValueError("matrix 至少要包含一行")
+        if len(value) > 12:
+            raise ValueError("matrix 行数不能超过 12")
+        width = len(value[0])
+        if width == 0 or width > 12:
+            raise ValueError("matrix 列数须在 1..12 之间")
         for i, row in enumerate(value):
+            if len(row) != width:
+                raise ValueError(f"第 {i} 行长度与首行不一致（应为 {width}）")
             for j, cell in enumerate(row):
                 if isinstance(cell, bool):
-                    raise ValueError(
-                        f"matrix[{i}][{j}] 不能是布尔值，须为整数或 null"
-                    )
-                if cell is not None and cell < 0:
+                    raise ValueError(f"matrix[{i}][{j}] 不能是布尔值，须为整数")
+                if cell < 0:
                     raise ValueError(f"matrix[{i}][{j}] 不能为负数：{cell}")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_names(self) -> "RegisterTableRequest":
+        rows = len(self.matrix)
+        cols = len(self.matrix[0])
+        if self.row_names is not None:
+            if len(self.row_names) != rows:
+                raise ValueError(f"row_names 长度须等于行数 {rows}")
+            if any(not name.strip() for name in self.row_names):
+                raise ValueError("row_names 不能包含空字符串")
+        if self.col_names is not None:
+            if len(self.col_names) != cols:
+                raise ValueError(f"col_names 长度须等于列数 {cols}")
+            if any(not name.strip() for name in self.col_names):
+                raise ValueError("col_names 不能包含空字符串")
+        return self
+
+
+class BatchTotalsRequest(BaseModel):
+    """一批简报拟用的行/列/总计合计；null 表示本批不涉及该合计。"""
+
+    month: str = Field(..., description="目标月份，格式 YYYY-MM")
+    row_totals: list[StrictInt | None] = Field(
+        ..., description="行合计（5 的倍数），长度须等于矩阵行数；null 表示本批不确认该行"
+    )
+    col_totals: list[StrictInt | None] = Field(
+        ..., description="列合计（5 的倍数），长度须等于矩阵列数；null 表示本批不确认该列"
+    )
+    grand_total: StrictInt | None = Field(
+        default=None, description="全表总计（5 的倍数）；null 表示本批不确认总计"
+    )
+    batch_label: str | None = Field(
+        default=None, description="本批备注（可选），仅用于审计展示"
+    )
+
+    @field_validator("month")
+    @classmethod
+    def _validate_month(cls, value: str) -> str:
+        if not MONTH_PATTERN.match(value):
+            raise ValueError("month 必须是 YYYY-MM 格式且月份在 01..12 之间")
         return value
 
     @field_validator("row_totals", "col_totals")
     @classmethod
-    def _validate_totals(cls, value):
+    def _validate_total_list(cls, value: list[int | None]) -> list[int | None]:
+        if not value:
+            raise ValueError("合计数组不能为空")
+        if len(value) > 12:
+            raise ValueError("合计数组长度不能超过 12")
         for i, cell in enumerate(value):
+            if cell is None:
+                continue
             if isinstance(cell, bool):
-                raise ValueError(f"合计值不能是布尔值：位置 {i}")
+                raise ValueError(f"位置 {i} 的合计不能是布尔值")
             if cell < 0:
-                raise ValueError(f"合计值不能为负数：位置 {i} = {cell}")
+                raise ValueError(f"位置 {i} 的合计不能为负数：{cell}")
+            if cell % 5 != 0:
+                raise ValueError(f"位置 {i} 的合计必须是 5 的倍数：{cell}")
         return value
 
-    @model_validator(mode="after")
-    def _check_shape(self) -> "SuppressionRequest":
-        if not self.matrix:
-            raise ValueError("matrix 至少要包含一行")
-        if len(self.matrix) > 12:
-            raise ValueError("matrix 行数不能超过 12")
-        width = len(self.matrix[0])
-        if width == 0 or width > 12:
-            raise ValueError("matrix 列数须在 1..12 之间")
-        for i, row in enumerate(self.matrix):
-            if len(row) != width:
-                raise ValueError(f"第 {i} 行长度与首行不一致（应为 {width}）")
-        if len(self.row_totals) != len(self.matrix):
-            raise ValueError("row_totals 长度须等于矩阵行数")
-        if len(self.col_totals) != width:
-            raise ValueError("col_totals 长度须等于矩阵列数")
-        if any(v < 0 for v in self.row_totals):
-            raise ValueError("row_totals 不能包含负数")
-        if any(v < 0 for v in self.col_totals):
-            raise ValueError("col_totals 不能包含负数")
-        return self
+    @field_validator("grand_total")
+    @classmethod
+    def _validate_grand(cls, value: int | None) -> int | None:
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            raise ValueError("grand_total 不能是布尔值")
+        if value < 0:
+            raise ValueError(f"grand_total 不能为负数：{value}")
+        if value % 5 != 0:
+            raise ValueError(f"grand_total 必须是 5 的倍数：{value}")
+        return value
 
     model_config = {
         "json_schema_extra": {
-            "examples": [
-                {"summary": "可行：隐藏格存在取值区间（不可还原）", "value": EX_RANGE},
-                {"summary": "可行：隐藏格被合计唯一锁定（可还原）", "value": EX_RECOVERABLE},
-                {"summary": "冲突：行列总合计不相等", "value": EX_TOTAL_CONFLICT},
-                {"summary": "冲突：总量相等但结构无解（Hall 条件）", "value": EX_HALL_CONFLICT},
-            ]
+            "examples": [EX_BATCH_1, EX_BATCH_2, EX_BATCH_COMBINED]
         }
     }
 
+
+# ---------------------------------------------------------------------------
+# 响应模型
+# ---------------------------------------------------------------------------
 
 class Dimensions(BaseModel):
     rows: int
     cols: int
 
 
-class CellRange(BaseModel):
-    row: int = Field(..., description="隐藏格行下标（从 0 开始）")
-    col: int = Field(..., description="隐藏格列下标（从 0 开始）")
-    min: int = Field(..., description="在全部合计同时成立前提下该格的最小取值")
-    max: int = Field(..., description="在全部合计同时成立前提下该格的最大取值")
-    recoverable: bool = Field(
-        ..., description="min == max 时为 true，表示可被公开合计精确反推"
-    )
-
-
-class FeasibleResponse(BaseModel):
-    status: Literal["feasible"]
+class RegisteredTableResponse(BaseModel):
+    status: Literal["registered"]
+    month: str
     dimensions: Dimensions
-    grand_total: int = Field(..., description="行合计之和（等于列合计之和）")
-    hidden_count: int
-    recoverable_count: int = Field(..., description="可还原隐藏格数量")
-    cells: list[CellRange] = Field(
-        ..., description="每个隐藏格的取值区间与可还原标记，按行优先顺序"
+    row_names: list[str]
+    col_names: list[str]
+    matrix: list[list[int]] = Field(..., description="登记入库的原始矩阵（不可修改）")
+    legal_row_ranges: list[list[int]] = Field(
+        ..., description="每行合计的合法取整区间 [下界, 上界]"
     )
-    minimizer_matrix: list[list[int]] = Field(
-        ..., description="达到各隐藏格下界的完整可行矩阵（对首个隐藏格取 min）"
+    legal_col_ranges: list[list[int]] = Field(
+        ..., description="每列合计的合法取整区间 [下界, 上界]"
     )
-    maximizer_matrix: list[list[int]] = Field(
-        ..., description="达到各隐藏格上界的完整可行矩阵（对首个隐藏格取 max）"
+    legal_grand_range: list[int] = Field(
+        ..., description="全表总计的合法取整区间 [下界, 上界]"
     )
 
 
-class ConflictWitness(BaseModel):
-    max_flow: int
-    required_flow: int
-    row_subset: list[int] = Field(
-        ..., description="最小割源侧的行下标集合 R（0 起）"
+class ConfirmedItem(BaseModel):
+    kind: Literal["row", "col", "grand"]
+    index: int = Field(..., description="行/列下标（从 0 开始）；总计固定为 0")
+    name: str = Field(..., description="行/列名称；总计为 grand_total")
+    value: int
+
+
+class BatchAcceptedResponse(BaseModel):
+    status: Literal["accepted"]
+    month: str
+    batch_no: int = Field(..., description="本批在该月份下的序号（从 1 开始）")
+    newly_confirmed: list[ConfirmedItem] = Field(
+        ..., description="本批新写入的合计；与已确认值相同的合计幂等忽略，不在此列"
     )
-    neighbor_cols: list[int] = Field(
-        ..., description="与 R 中隐藏格相邻的列下标集合 N(R)"
+    confirmed_totals: list[ConfirmedItem] = Field(
+        ..., description="写入后该月份全部已确认合计"
     )
-    subset_demand: int = Field(..., description="行子集 R 的隐藏格总需求")
-    neighbor_supply: int = Field(
-        ..., description="邻接列 N(R) 能承接的总供给，小于需求即无解"
+    witness_matrix: list[list[int]] = Field(
+        ..., description="同时满足全部已确认合计的一张取整矩阵"
     )
+    witness_row_totals: list[int] = Field(..., description="见证矩阵的行合计")
+    witness_col_totals: list[int] = Field(..., description="见证矩阵的列合计")
+    witness_grand_total: int = Field(..., description="见证矩阵的全表总计")
 
 
 class ConflictResponse(BaseModel):
     status: Literal["conflict"]
+    month: str
     reasons: list[str] = Field(
-        ..., description="冲突的文字说明；无解时不返回任何取值区间"
+        ..., description="冲突的文字说明；本批不会写入，已确认合计保持不变"
     )
-    witness: ConflictWitness | None = Field(
-        default=None, description="最大流最小割给出的 Hall 型冲突见证（若适用）"
+    confirmed_totals: list[ConfirmedItem] = Field(
+        ..., description="当前仍然有效的已确认合计"
     )
+
+
+class MonthlyMatrixResponse(BaseModel):
+    status: Literal["ok"]
+    month: str
+    dimensions: Dimensions
+    row_names: list[str]
+    col_names: list[str]
+    original_matrix: list[list[int]] = Field(..., description="登记的原始整数矩阵")
+    rounded_matrix: list[list[int]] = Field(
+        ..., description="符合全部已确认合计的一张取整矩阵（每格为最近 5 倍数）"
+    )
+    row_totals: list[int] = Field(..., description="从取整矩阵格值加出的行合计")
+    col_totals: list[int] = Field(..., description="从取整矩阵格值加出的列合计")
+    grand_total: int = Field(..., description="从取整矩阵格值加出的全表总计")
+    confirmed_totals: list[ConfirmedItem] = Field(
+        ..., description="当前已确认合计；无确认时取整矩阵仅满足取整规则"
+    )
+
+
+class MonthSummary(BaseModel):
+    month: str
+    dimensions: Dimensions
+    confirmed_count: int = Field(..., description="已确认合计条目数")
+    batches: int = Field(..., description="已接受的批次数")
 
 
 class HealthResponse(BaseModel):
